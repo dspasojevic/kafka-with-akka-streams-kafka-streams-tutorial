@@ -7,57 +7,60 @@ import akka.stream.stage._
 import com.lightbend.model.winerecord.WineRecord
 import com.lightbend.scala.modelServer.model.{Model, ModelToServeStats, ModelWithDescriptor, ServingResult}
 
-/**
- * Implements model updates and serving using a custom Akka Streams "stage".
- */
-class ModelStage extends GraphStageWithMaterializedValue[FlowShape[WineRecord, ServingResult], ModelStateStore] {
+class ModelStage extends GraphStageWithMaterializedValue[FanInShape2[WineRecord, ModelWithDescriptor, ServingResult], ModelStateStore] {
 
-  val dataRecordIn: Inlet[WineRecord] = Inlet[WineRecord]("dataRecordIn")
-  val scoringResultOut: Outlet[ServingResult] = Outlet[ServingResult]("scoringOut")
-
-  override val shape: FlowShape[WineRecord, ServingResult] = FlowShape(dataRecordIn, scoringResultOut)
+  override val shape: FanInShape2[WineRecord, ModelWithDescriptor, ServingResult] = new FanInShape2("other_model_shape")
 
   class ModelLogic extends GraphStageLogicWithLogging(shape) {
     // state must be kept in the Logic instance, since it is created per stream materialization
     private var currentModel: Option[Model] = None
-    private var newModel: Option[Model] = None
-    var currentState: Option[ModelToServeStats] = None // exposed in materialized value
-    private var newState: Option[ModelToServeStats] = None
+    var currentState: Option[ModelToServeStats] = None
+    var delayedRecord: Option[WineRecord] = None
 
-    val setModelCB = getAsyncCallback[ModelWithDescriptor] { model =>
-      println(s"Updated model: $model")
-      newState = Some(ModelToServeStats(model.descriptor))
-      newModel = Some(model.model)
+    private def scoreWine(record: WineRecord, model: Model): Unit = {
+      val start = System.nanoTime()
+      val quality = model.score(record).asInstanceOf[Double]
+      val duration = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)
+      currentState = currentState.map(_.incrementUsage(duration))
+      push(shape.out, ServingResult(quality, duration))
     }
 
-    setHandler(dataRecordIn, new InHandler {
+    setHandler(shape.in0, new InHandler {
       override def onPush(): Unit = {
-        val record = grab(dataRecordIn)
-        newModel.foreach { model =>
-          // close current model first
-          currentModel.foreach(_.cleanup())
-          // Update model
-          currentModel = Some(model)
-          currentState = newState
-          newModel = None
-        }
+
+        val record = grab(shape.in0)
+
         currentModel match {
           case Some(model) =>
-            val start = System.nanoTime()
-            val quality = model.score(record).asInstanceOf[Double]
-            val duration = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)
-            currentState = currentState.map(_.incrementUsage(duration))
-            push(scoringResultOut, ServingResult(quality, duration))
-
+            scoreWine(record, model)
           case None =>
-            push(scoringResultOut, ServingResult.noModel)
+            // No model yet, statsh the record and request a model.
+            delayedRecord = Some(record)
+            pull(shape.in1)
         }
       }
     })
 
-    setHandler(scoringResultOut, new OutHandler {
-      override def onPull(): Unit = pull(dataRecordIn)
+    setHandler(shape.in1, new InHandler {
+      override def onPush(): Unit = {
+        val modelWithDescriptor = grab(shape.in1)
+        println(s"Set model [$modelWithDescriptor], requesting more model.")
+        currentModel = Some(modelWithDescriptor.model)
+        currentState = Some(ModelToServeStats(modelWithDescriptor.descriptor))
+        pull(shape.in1)
+        delayedRecord.foreach { record =>
+          scoreWine(record, modelWithDescriptor.model)
+          delayedRecord = None
+        }
+      }
     })
+
+    setHandler(shape.out, new OutHandler {
+      override def onPull(): Unit = {
+        pull(shape.in0)
+      }
+    })
+
   }
 
   override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, ModelStateStore) = {
@@ -68,9 +71,10 @@ class ModelStage extends GraphStageWithMaterializedValue[FlowShape[WineRecord, S
       override def getCurrentServingInfo: ModelToServeStats =
         logic.currentState.getOrElse(ModelToServeStats.empty)
 
-      override def setModel(model: ModelWithDescriptor): Unit =
-        logic.setModelCB.invoke(model)
+      override def setModel(model: ModelWithDescriptor): Unit = () // Ignore writes. Model updated through inlet.
     }
     (logic, modelStateStore)
   }
+
 }
+
